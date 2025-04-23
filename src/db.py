@@ -33,6 +33,25 @@ def init_db():
             FOREIGN KEY(winner_id) REFERENCES players(id)
         );
         """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS team_matches (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            team1_player1_id INTEGER,
+            team1_player2_id INTEGER,
+            team2_player1_id INTEGER,
+            team2_player2_id INTEGER,
+            score1 INTEGER,
+            score2 INTEGER,
+            confirmed_player2 BOOLEAN DEFAULT 0,
+            confirmed_player3 BOOLEAN DEFAULT 0,
+            confirmed_player4 BOOLEAN DEFAULT 0,
+            timestamp TEXT DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(team1_player1_id) REFERENCES players(id),
+            FOREIGN KEY(team1_player2_id) REFERENCES players(id),
+            FOREIGN KEY(team2_player1_id) REFERENCES players(id),
+            FOREIGN KEY(team2_player2_id) REFERENCES players(id)
+        );
+        """)
         conn.commit()
 
 def register_player(telegram_id, username):
@@ -118,3 +137,150 @@ def get_games_played(player_id):
         WHERE confirmed = 1 AND (player1_id = ? OR player2_id = ?)
         """, (player_id, player_id))
         return cur.fetchone()[0]
+
+def record_team_match(t1p1, t1p2, t2p1, t2p2, score1, score2):
+    with connect() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+        INSERT INTO team_matches (
+            team1_player1_id, team1_player2_id,
+            team2_player1_id, team2_player2_id,
+            score1, score2, confirmed
+        ) VALUES (?, ?, ?, ?, ?, ?, 0)
+        """, (t1p1, t1p2, t2p1, t2p2, score1, score2))
+        conn.commit()
+        return cur.lastrowid
+
+def confirm_team_match(match_id, k=32):
+    with connect() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM team_matches WHERE id = ?", (match_id,))
+        match = cur.fetchone()
+
+        if not match or match[7]:  # already confirmed
+            return False
+
+        # unpack players and scores
+        _, t1p1, t1p2, t2p1, t2p2, score1, score2, *_ = match
+
+        winner_team = 1 if score1 > score2 else 2
+
+        team1 = [get_player_by_id(t1p1), get_player_by_id(t1p2)]
+        team2 = [get_player_by_id(t2p1), get_player_by_id(t2p2)]
+
+        team1_avg = sum(p[3] for p in team1) / 2
+        team2_avg = sum(p[3] for p in team2) / 2
+
+        if winner_team == 1:
+            winners = team1
+            losers = team2
+            r_win_avg = team1_avg
+            r_lose_avg = team2_avg
+        else:
+            winners = team2
+            losers = team1
+            r_win_avg = team2_avg
+            r_lose_avg = team1_avg
+
+        # Пересчёт рейтингов каждого игрока
+        for player in winners:
+            new_rating, _ = calculate_elo(player[3], r_lose_avg, k)
+            cur.execute("UPDATE players SET rating = ? WHERE id = ?", (new_rating, player[0]))
+
+        for player in losers:
+            _, new_rating = calculate_elo(r_win_avg, player[3], k)
+            cur.execute("UPDATE players SET rating = ? WHERE id = ?", (new_rating, player[0]))
+
+        cur.execute("UPDATE team_matches SET confirmed = 1 WHERE id = ?", (match_id,))
+        conn.commit()
+        return True
+
+def record_team_match(t1p1, t1p2, t2p1, t2p2, score1, score2):
+    with connect() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+        INSERT INTO team_matches (
+            team1_player1_id, team1_player2_id,
+            team2_player1_id, team2_player2_id,
+            score1, score2
+        ) VALUES (?, ?, ?, ?, ?, ?)
+        """, (t1p1, t1p2, t2p1, t2p2, score1, score2))
+        conn.commit()
+        return cur.lastrowid
+
+def get_team_match(match_id):
+    with connect() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM team_matches WHERE id = ?", (match_id,))
+        return cur.fetchone()
+
+def confirm_team_participant(match_id, telegram_id):
+    match = get_team_match(match_id)
+    if not match:
+        return False
+
+    # Получаем ID игроков
+    _, t1p1, t1p2, t2p1, t2p2, *_ = match
+    player_ids = [t1p1, t1p2, t2p1, t2p2]
+    player_map = {get_player_by_id(pid)[1]: pid for pid in player_ids}  # telegram_id → id
+
+    if telegram_id not in player_map:
+        return False
+
+    # Определим, какая колонка подтверждения относится к пользователю
+    telegram_ids = list(player_map.keys())
+    pid_index = telegram_ids.index(telegram_id)
+
+    column = f"confirmed_player{pid_index + 1}"
+
+    with connect() as conn:
+        cur = conn.cursor()
+        cur.execute(f"UPDATE team_matches SET {column} = 1 WHERE id = ?", (match_id,))
+        conn.commit()
+
+    return True
+
+def is_team_match_fully_confirmed(match_id):
+    match = get_team_match(match_id)
+    if not match:
+        return False
+    confirmed_flags = match[7:10]
+    return all(confirmed_flags)
+
+def finalize_team_match(match_id, k=32):
+    match = get_team_match(match_id)
+    if not match:
+        return False
+
+    _, t1p1, t1p2, t2p1, t2p2, score1, score2, *_ = match
+
+    winner_team = 1 if score1 > score2 else 2
+
+    team1 = [get_player_by_id(t1p1), get_player_by_id(t1p2)]
+    team2 = [get_player_by_id(t2p1), get_player_by_id(t2p2)]
+
+    team1_avg = sum(p[3] for p in team1) / 2
+    team2_avg = sum(p[3] for p in team2) / 2
+
+    if winner_team == 1:
+        winners = team1
+        losers = team2
+        r_win_avg = team1_avg
+        r_lose_avg = team2_avg
+    else:
+        winners = team2
+        losers = team1
+        r_win_avg = team2_avg
+        r_lose_avg = team1_avg
+
+    with connect() as conn:
+        cur = conn.cursor()
+        for player in winners:
+            new_rating, _ = calculate_elo(player[3], r_lose_avg, k)
+            cur.execute("UPDATE players SET rating = ? WHERE id = ?", (new_rating, player[0]))
+        for player in losers:
+            _, new_rating = calculate_elo(r_win_avg, player[3], k)
+            cur.execute("UPDATE players SET rating = ? WHERE id = ?", (new_rating, player[0]))
+        conn.commit()
+
+    return True
